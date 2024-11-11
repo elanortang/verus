@@ -1,14 +1,14 @@
 use crate::ast::{
-    ArithOp, BinaryOp, BinaryOpr, BitwiseOp, Constant, CtorPrintStyle, Ident, InequalityOp,
+    ArithOp, BinaryOp, BinaryOpr, BitwiseOp, Constant, CtorPrintStyle, Dt, Ident, InequalityOp,
     IntRange, IntegerTypeBitwidth, IntegerTypeBoundKind, Mode, Quant, SpannedTyped, Typ, TypX,
     Typs, UnaryOp, UnaryOpr, VarBinder, VarBinderX, VarBinders,
 };
-use crate::ast_util::get_variant;
+use crate::ast_util::{get_variant, unit_typ};
 use crate::context::GlobalCtx;
 use crate::def::{unique_bound, user_local_name, Spanned};
 use crate::interpreter::InterpExp;
 use crate::messages::Span;
-use crate::sst::{BndX, CallFun, Exp, ExpX, Stm, Trig, Trigs, UniqueIdent};
+use crate::sst::{BndX, CallFun, Exp, ExpX, LocalDeclKind, Stm, Trig, Trigs, UniqueIdent};
 use air::scope_map::ScopeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -209,10 +209,10 @@ fn subst_exp_rec(
                     );
                     BndX::Let(binders)
                 }
-                BndX::Quant(quant, binders, ts) => {
+                BndX::Quant(quant, binders, ts, ab) => {
                     let binders =
                         subst_rename_binders(&bnd.span, substs, free_vars, binders, ft, ft);
-                    BndX::Quant(*quant, binders, ftrigs(substs, free_vars, ts))
+                    BndX::Quant(*quant, binders, ftrigs(substs, free_vars, ts), ab.clone())
                 }
                 BndX::Lambda(binders, ts) => {
                     let binders =
@@ -447,9 +447,6 @@ impl ExpX {
                             prec_exp,
                         )
                     }
-                    TupleField { tuple_arity: _, field } => {
-                        (format!("{}.{}", exp.x.to_user_string(global), field), 99)
-                    }
                     Field(field) => {
                         (format!("{}.{}", exp.x.to_user_string(global), field.field), 99)
                     }
@@ -540,7 +537,7 @@ impl ExpX {
                             .join(", ");
                         format!("let {} in {}", assigns, exp.x.to_user_string(global))
                     }
-                    BndX::Quant(Quant { quant: q, .. }, bnds, _trigs) => {
+                    BndX::Quant(Quant { quant: q, .. }, bnds, _trigs, _) => {
                         let q_str = match q {
                             air::ast::Quant::Forall => "forall",
                             air::ast::Quant::Exists => "exists",
@@ -577,27 +574,43 @@ impl ExpX {
                 };
                 (s, 99)
             }
-            Ctor(path, variant_id, bnds) => {
-                let style = match global.datatypes.get(path) {
-                    Some((_, variants)) => get_variant(variants, variant_id).ctor_style,
-                    _ => CtorPrintStyle::Braces,
+            Ctor(dt, variant_id, bnds) => {
+                let style = match dt {
+                    Dt::Path(path) => match global.datatypes.get(path) {
+                        Some((_, variants)) => get_variant(variants, variant_id).ctor_style,
+                        _ => CtorPrintStyle::Braces,
+                    },
+                    Dt::Tuple(_) => CtorPrintStyle::Tuple,
                 };
                 match style {
-                    CtorPrintStyle::Parens => {
-                        let args = bnds
-                            .iter()
-                            .map(|b| b.a.x.to_user_string(global))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("{}({})", variant_id, args), 99)
-                    }
-                    CtorPrintStyle::Tuple => {
-                        let args = bnds
-                            .iter()
-                            .map(|b| b.a.x.to_user_string(global))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("({})", args), 99)
+                    CtorPrintStyle::Parens | CtorPrintStyle::Tuple => {
+                        match sst_unpack_tuple_style_ctor(self) {
+                            Some(es) => {
+                                let args = es
+                                    .iter()
+                                    .map(|e| e.x.to_user_string(global))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let variant = if matches!(style, CtorPrintStyle::Parens) {
+                                    &variant_id
+                                } else {
+                                    ""
+                                };
+                                (format!("{}({})", variant, args), 99)
+                            }
+                            None => {
+                                // This probably shouldn't happen; if it does, fall back
+                                // on the brace style
+                                let args = bnds
+                                    .iter()
+                                    .map(|b| {
+                                        format!("{}: {}", b.name, b.a.x.to_user_string(global))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                (format!("{} {} {} {}", variant_id, "{", args, "}"), 99)
+                            }
+                        }
                     }
                     CtorPrintStyle::Const => (format!("{}", variant_id), 99),
                     CtorPrintStyle::Braces => {
@@ -745,4 +758,57 @@ pub fn sst_int_literal(span: &Span, i: i128) -> Exp {
         &Arc::new(TypX::Int(IntRange::Int)),
         ExpX::Const(crate::ast_util::const_int_from_i128(i)),
     )
+}
+
+impl LocalDeclKind {
+    pub fn is_mutable(&self) -> bool {
+        match self {
+            LocalDeclKind::Param { mutable } => *mutable,
+            LocalDeclKind::StmtLet { mutable } => *mutable,
+            LocalDeclKind::Return => false,
+            LocalDeclKind::TempViaAssign => false,
+            LocalDeclKind::Decreases => false,
+            LocalDeclKind::StmCallArg { native: _ } => false,
+            LocalDeclKind::Assert => false,
+            LocalDeclKind::AssertByVar { native: _ } => false,
+            LocalDeclKind::LetBinder => false,
+            LocalDeclKind::QuantBinder => false,
+            LocalDeclKind::ChooseBinder => false,
+            LocalDeclKind::ClosureBinder => false,
+            LocalDeclKind::OpenInvariantBinder => true,
+            LocalDeclKind::ExecClosureId => false,
+            LocalDeclKind::ExecClosureParam => false,
+            LocalDeclKind::ExecClosureRet => false,
+        }
+    }
+}
+
+/// Unit value
+pub fn sst_unit_value(span: &Span) -> Exp {
+    let name = Dt::Tuple(0);
+    let variant = crate::def::prefix_tuple_variant(0);
+    SpannedTyped::new(span, &unit_typ(), ExpX::Ctor(name, variant, Arc::new(vec![])))
+}
+
+pub fn sst_unpack_tuple_style_ctor(expx: &ExpX) -> Option<Vec<Exp>> {
+    match &expx {
+        ExpX::Ctor(_dt, _ident, binders) => {
+            let n = binders.len();
+            let mut results: Vec<Exp> = vec![];
+            'outer: for i in 0..n {
+                let field = crate::def::positional_field_ident(i);
+                // Look for field named "i"
+                for b in binders.iter() {
+                    if b.name == field {
+                        results.push(b.a.clone());
+                        continue 'outer;
+                    }
+                }
+                // If no field of name "i", then error
+                return None;
+            }
+            return Some(results);
+        }
+        _ => None,
+    }
 }
